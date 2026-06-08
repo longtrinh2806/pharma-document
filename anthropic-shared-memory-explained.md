@@ -83,6 +83,39 @@ Một message có thể chứa **nhiều blocks**. Ví dụ: LLM reply vừa có
 
 LLM không "gọi" tool theo nghĩa thông thường. Nó **trả về JSON mô tả tool cần dùng**, framework execute thật rồi append kết quả vào conversation, gọi LLM lại.
 
+### 1.4 Tool Call Protocol — LLM không tự chạy tool
+
+Đây là điểm dễ nhầm nhất. LLM **không có khả năng gọi code**. Cơ chế thực tế là:
+
+```
+AgentRunner                    LLM (Anthropic API)              Tool (code thực)
+──────────────────────────────────────────────────────────────────────────────
+
+[1] gửi messages →             nhận messages, suy nghĩ...
+                        ←      trả về text:
+                               {
+                                 type: "tool_use",
+                                 name: "search_drug",     ← LLM CHỈ VIẾT TÊN
+                                 input: { query: "Warfarin" }
+                               }
+                               (LLM dừng, đang chờ)
+
+[2] runner đọc response
+    thấy type = "tool_use"
+    → gọi search_drug(...)  →                             search_drug() chạy
+                                                           query vector DB
+                                                           return kết quả ←
+
+[3] runner đóng gói:
+    { type: "tool_result",
+      tool_use_id: "abc",
+      content: "10mg/day..." }
+    → gửi lại cho LLM       →  nhận kết quả, tiếp tục...
+                        ←      trả về text answer cuối cùng
+```
+
+**Tóm lại:** LLM = bộ não ra quyết định. AgentRunner = tay chân thực thi. LLM chỉ đọc và viết text.
+
 **C# tương đương:**
 ```csharp
 public abstract record ContentBlock(string Type);
@@ -572,6 +605,52 @@ public sealed class SharedMemory
 ## Layer 7: Coordinator Pattern — Killer Feature (`orchestrator.ts`)
 
 `runTeam()` là 5 bước tuyến tính. Đây là điểm khác biệt lớn nhất với "gọi LLM thông thường".
+
+### 7.0 Từ câu hỏi user → task list
+
+Đây là câu hỏi quan trọng nhất: **ai tạo ra task list?**
+
+Câu trả lời: **một Coordinator Agent** chạy trước tất cả. Nhiệm vụ duy nhất của nó là đọc câu hỏi và trả về JSON task list. Framework sau đó đọc JSON đó và thực thi.
+
+```typescript
+// Coordinator Agent được cấu hình với outputSchema → ép LLM trả JSON đúng format
+const coordinatorAgent = new Agent({
+    name: 'coordinator',
+    systemPrompt: `
+        Khi nhận goal, phân tích và trả về JSON danh sách tasks.
+        Agents có sẵn: drug-retriever, interaction-check, dosage-analyst, summarizer
+    `,
+    outputSchema: TaskListSchema,
+})
+
+// User hỏi bằng ngôn ngữ tự nhiên
+const userQuestion = `Bệnh nhân 70 tuổi, suy thận độ 2. Đang dùng Warfarin.
+                      Muốn thêm Amiodarone. An toàn không?`
+
+// [1] Coordinator gọi LLM → LLM đọc câu hỏi → LLM TỰ QUYẾT tasks cần làm
+const plan = await coordinatorAgent.run(userQuestion)
+
+// plan.structured = {
+//   tasks: [
+//     { agent: "drug-retriever",    prompt: "Retrieve: Warfarin + Amiodarone CYP2C9 interactions" },
+//     { agent: "drug-retriever",    prompt: "Retrieve: Warfarin dosing in CKD stage 2, elderly"  },
+//     { agent: "interaction-check", prompt: "Check: Warfarin + Amiodarone severity and mechanism" },
+//   ]
+// }
+
+// [2] Framework đọc JSON → chạy song song
+const results = await pool.runParallel(plan.structured.tasks)
+//                                      ^^^^^^^^^^^^^^^^^^^
+//                          đây là array LLM vừa sinh ra, không phải hardcode
+
+// [3] Summarize
+const finalAnswer = await pool.run('summarizer', buildPrompt(results))
+```
+
+**Điểm mấu chốt:**
+- LLM KHÔNG gọi `pool.run()` — LLM chỉ trả về JSON
+- Framework đọc JSON → gọi `pool.run()` thật
+- Logic phân tích nằm trong LLM, không phải trong if/else của code
 
 ### 7.1 Flow đầy đủ
 
