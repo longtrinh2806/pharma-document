@@ -3,6 +3,22 @@
 > **Stack:** .NET 10, Clean Architecture (API / Application / Domain / Infrastructure)  
 > **Pattern:** Re-implement Anthropic open-multi-agent framework in C#, từng layer một  
 > **Rule:** Phase sau mới implement → Phase trước `throw new NotImplementedException()`
+> **LLM runtime:** Ollama (local) thay vì Anthropic API — `ILlmAdapter` là abstraction layer, có thể swap sau.
+
+---
+
+## Trạng thái tổng quan
+
+| Phase | Mô tả | Trạng thái |
+|-------|-------|-----------|
+| 1 | Core types + ILlmAdapter + OllamaAdapter + basic chat | ✅ Done (diverged — xem chi tiết) |
+| 2 | Tools infrastructure | ❌ Chưa bắt đầu |
+| 3 | Chat history (multi-turn) | ✅ Done (diverged — xem chi tiết) |
+| 4 | RAG + pgvector | ❌ Chưa bắt đầu |
+| 5 | Multi-agent (TaskQueue + AgentPool) | ❌ Chưa bắt đầu |
+| 6 | Coordinator + Orchestrator | ❌ Chưa bắt đầu |
+
+**`AgentRunner` chưa implement** — đây là nền của Phase 2–6. Phải làm trước khi tiếp tục.
 
 ---
 
@@ -18,7 +34,7 @@ pharma-ai-assistant-service/
   Pharma.AiAssistant.API/            ← HTTP endpoints, DI wiring
   Pharma.AiAssistant.Application/    ← Use cases (ChatUseCase, AnalyzeDrugUseCase...)
   Pharma.AiAssistant.Domain/         ← Core AI types + interfaces (không phụ thuộc gì)
-  Pharma.AiAssistant.Infrastructure/ ← Adapters (Anthropic HTTP, Postgres, VectorDB, Tools)
+  Pharma.AiAssistant.Infrastructure/ ← Adapters (Ollama HTTP, Postgres, VectorDB, Tools)
 ```
 
 **Dependency direction:**
@@ -29,64 +45,48 @@ Infrastructure → Domain (implements interfaces)
 
 ---
 
-## Phase 1 — Scaffold + Core Types + Simple Chat
+## Phase 1 — Scaffold + Core Types + Simple Chat ✅ Done
 
-**Goal:** Gọi được Anthropic API, nhận được response. Chưa có tools, chưa có history.
+**Divergence từ plan gốc:** Architecture thực tế dùng MediatR (Commands/Queries) thay vì plain use-cases. Tất cả endpoint đi qua `IMediator`. Streaming dùng `IStreamMessageHandler` inject trực tiếp vào controller (MediatR không support `IAsyncEnumerable`).
 
-### 1.1 Domain layer — Core AI types
+### ✅ 1.1 Domain layer — Core AI types
 
+Files đã có tại `Pharma.AiAssistant.Domain/Ai/`:
+- `ContentBlock.cs` — `TextBlock`, `ToolUseBlock`, `ToolResultBlock`
+- `LlmMessage.cs` — `record LlmMessage(string Role, IReadOnlyList<ContentBlock> Content)` + static helpers `UserText`, `AssistantText`
+- `LlmResponse.cs` — `record LlmResponse(IReadOnlyList<ContentBlock> Content, TokenUsage Usage)`
+- `TokenUsage.cs` — `record TokenUsage(int InputTokens, int OutputTokens)`
+- `RunResult.cs` — ❌ Chưa tạo (cần khi implement AgentRunner)
+
+### ✅ 1.2 Infrastructure layer — OllamaAdapter
+
+`Pharma.AiAssistant.Infrastructure/Services/OllamaLlmAdapter.cs` đã implement:
+- `ChatAsync` — POST `/api/chat` với `Stream: false`
+- `StreamAsync` — POST `/api/chat` với `Stream: true`, NDJSON line-by-line, `HttpCompletionOption.ResponseHeadersRead`
+- `JsonSerializerOptions { PropertyNameCaseInsensitive = true }` — fix JSON case sensitivity với Ollama
+
+Config trong `launchSettings.json`:
 ```
-Pharma.AiAssistant.Domain/
-  Ai/
-    ContentBlock.cs      ← TextBlock, ToolUseBlock, ToolResultBlock
-    LlmMessage.cs        ← record LlmMessage(string Role, IReadOnlyList<ContentBlock> Content)
-    LlmResponse.cs       ← record LlmResponse(IReadOnlyList<ContentBlock> Content, TokenUsage Usage)
-    TokenUsage.cs        ← record TokenUsage(int InputTokens, int OutputTokens)
-    RunResult.cs         ← record RunResult(string Output, IReadOnlyList<LlmMessage> Messages, ...)
-  Interfaces/
-    ILlmAdapter.cs       ← Task<LlmResponse> ChatAsync(IList<LlmMessage> messages, ...)
-```
-
-```csharp
-// ContentBlock.cs
-public abstract record ContentBlock(string Type);
-public sealed record TextBlock(string Text) : ContentBlock("text");
-public sealed record ToolUseBlock(string Id, string Name, JsonObject Input) : ContentBlock("tool_use");
-public sealed record ToolResultBlock(string ToolUseId, string Content, bool? IsError = null) : ContentBlock("tool_result");
-```
-
-### 1.2 Infrastructure layer — AnthropicAdapter
-
-```
-Pharma.AiAssistant.Infrastructure/
-  Ai/
-    Anthropic/
-      AnthropicAdapter.cs     ← implements ILlmAdapter, gọi HTTP đến api.anthropic.com
-      AnthropicRequest.cs     ← serialize sang format Anthropic API
-      AnthropicResponse.cs    ← deserialize từ Anthropic API
+OLLAMA_BASE_URL=http://localhost:11434
+LLM_MODEL=gemma4:e4b
+LLM_MAX_TOKENS=4096
+LLM_SYSTEM_PROMPT=...
 ```
 
-```csharp
-// AnthropicAdapter.cs — chỉ cần làm được ChatAsync
-public async Task<LlmResponse> ChatAsync(IList<LlmMessage> messages, ChatOptions options, CancellationToken ct = default)
-{
-    // POST https://api.anthropic.com/v1/messages
-    // Header: x-api-key, anthropic-version
-    // Body: { model, max_tokens, system, messages }
-}
-```
+### ❌ 1.3 Domain layer — AgentRunner (THIẾU — cần implement)
 
-### 1.3 Domain layer — AgentRunner
+`AgentRunner` chưa có. Hiện tại `StreamMessageHandler` gọi thẳng `llmAdapter.StreamAsync()` — bỏ qua tầng này. Đây là **blocker** cho Phase 2 (tool execution) và Phase 5 (multi-agent).
 
 ```
 Pharma.AiAssistant.Domain/
   Ai/
     AgentRunner.cs    ← core while(true) loop
-    RunOptions.cs     ← MaxTurns, CancellationToken, ...
+    RunOptions.cs     ← MaxTurns, CancellationToken
+    RunResult.cs      ← record RunResult(string Output, IReadOnlyList<LlmMessage> Messages, ...)
 ```
 
 ```csharp
-// AgentRunner.cs — vòng lặp chính, phase này chưa có tools
+// AgentRunner.cs — Phase 1: chưa có tools
 public async Task<RunResult> RunAsync(IList<LlmMessage> messages, RunOptions options = default)
 {
     var conversation = new List<LlmMessage>(messages);
@@ -102,7 +102,6 @@ public async Task<RunResult> RunAsync(IList<LlmMessage> messages, RunOptions opt
         var toolUseBlocks = response.Content.OfType<ToolUseBlock>().ToList();
         if (!toolUseBlocks.Any())
         {
-            // Không có tool call → xong
             var output = response.Content.OfType<TextBlock>().FirstOrDefault()?.Text ?? "";
             return new RunResult(output, conversation.Skip(messages.Count).ToList(), response.Usage);
         }
@@ -115,49 +114,36 @@ public async Task<RunResult> RunAsync(IList<LlmMessage> messages, RunOptions opt
 }
 ```
 
-### 1.4 Application layer — ChatUseCase
+### ✅ 1.4 Application layer — Chat handlers (MediatR pattern)
 
-```
-Pharma.AiAssistant.Application/
-  UseCases/
-    Chat/
-      SimpleChatUseCase.cs
-      SimpleChatRequest.cs    ← record SimpleChatRequest(string Message)
-      SimpleChatResponse.cs   ← record SimpleChatResponse(string Reply)
-```
+Thay vì `SimpleChatUseCase`, dùng MediatR:
+- `CreateConversation.cs` — Command, tạo conversation + trả về `conversationId`
+- `GetConversations.cs` — Query, phân trang
+- `GetConversationDetail.cs` — Query, load messages (fix: `OrderBy(m => m.CreatedAt)`)
+- `StreamMessageHandler.cs` — `IStreamMessageHandler`, inject trực tiếp vào controller
 
-```csharp
-public async Task<SimpleChatResponse> ExecuteAsync(SimpleChatRequest request)
-{
-    var messages = new List<LlmMessage>
-    {
-        new("user", [new TextBlock(request.Message)])
-    };
-    var result = await _agentRunner.RunAsync(messages);
-    return new SimpleChatResponse(result.Output);
-}
-```
+Flow của `StreamMessageHandler.StreamAsync`:
+1. Save user message → DB
+2. Load full history từ DB, sort theo `CreatedAt`
+3. `await foreach` trên `llmAdapter.StreamAsync` → yield chunks về controller
+4. Sau khi stream xong → save assistant message (full text) → DB
+5. Nếu là message đầu tiên → gọi `ChatAsync` để gen title
 
-### 1.5 API layer — Endpoint
+### ✅ 1.5 API layer
 
-```
-Pharma.AiAssistant.API/
-  Endpoints/
-    ChatEndpoints.cs    ← POST /api/chat
-  Program.cs
-  appsettings.json      ← Anthropic:ApiKey, Anthropic:Model
-```
+`ConversationController.cs`:
+- `POST /conversation` — `CreateConversation` command
+- `GET /conversation` — `GetConversations` query (phân trang)
+- `GET /conversation/{id}` — `GetConversationDetail` query
+- `POST /conversation/{id}/messages/stream` — SSE endpoint, dùng `IStreamMessageHandler`
 
-**Verify Phase 1:**
-```
-POST /api/chat
-{ "message": "Warfarin là thuốc gì?" }
-→ Response có text từ Claude
-```
+SSE format: `data: {json_string}\n\n` per chunk, kết thúc bằng `data: [DONE]\n`
 
 ---
 
-## Phase 2 — Tools Infrastructure
+## Phase 2 — Tools Infrastructure ❌ Chưa bắt đầu
+
+**Dependency:** Cần implement `AgentRunner` (Phase 1.3) trước.
 
 **Goal:** LLM có thể "gọi tool", AgentRunner execute tool thật (dù tool chưa có logic RAG).
 
@@ -223,104 +209,43 @@ Hỏi câu khiến LLM muốn gọi search_drug
 
 ---
 
-## Phase 3 — Agent + Chat History
+## Phase 3 — Chat History ✅ Done
 
-**Goal:** Multi-turn conversation. User hỏi "còn với người già?" → AI nhớ context.
+**Divergence từ plan gốc:** Dùng `Conversation` + `Message` entities (không phải `ChatSession` + `ChatMessage` như plan). Không có `IChatSessionRepository` — dùng `IGenericRepository<T>` từ SharedKernel.
 
-### 3.1 Domain layer — Agent
+### ✅ Domain entities
 
-```
-Pharma.AiAssistant.Domain/
-  Ai/
-    Agent.cs            ← wrap AgentRunner, giữ messageHistory
-    AgentConfig.cs      ← Name, Model, SystemPrompt, MaxTurns, Tools[]
-    AgentStatus.cs      ← enum: Idle, Running, Completed, Error
-```
+`Pharma.AiAssistant.Domain/Entities/`:
+- `Conversation.cs` — `ConversationId`, `UserId (Ulid)`, `Title?`, audit fields
+- `Message.cs` — `MessageId`, `ConversationId`, `Role`, `Content`, `Model?`, audit fields
 
+### ✅ Persistence
+
+`Pharma.AiAssistant.Infrastructure/Persistence/`:
+- `WriteDbContext.cs`, `ReadOnlyDbContext.cs`
+- `ConversationConfiguration.cs`, `MessageConfiguration.cs`
+- Migration: `20260613121810_Initial.cs`
+
+### ✅ Multi-turn history
+
+`StreamMessageHandler` build history từ DB trước mỗi request:
 ```csharp
-public sealed class Agent
-{
-    private AgentRunner? _runner;           // lazy init
-    private List<LlmMessage> _history = [];
-    public AgentStatus Status { get; private set; } = AgentStatus.Idle;
+var histories = await messageRepository.FindAsync(
+    m => m.ConversationId == conversationId, cancellationToken);
 
-    // Fresh conversation — không dùng history
-    public Task<RunResult> RunAsync(string prompt, RunOptions? options = null)
-    {
-        var messages = new List<LlmMessage> { LlmMessage.UserText(prompt) };
-        return ExecuteAsync(messages, options);
-    }
-
-    // Multi-turn — append vào history
-    public async Task<RunResult> PromptAsync(string message)
-    {
-        _history.Add(LlmMessage.UserText(message));
-        var result = await ExecuteAsync([.._history]);
-        _history.AddRange(result.Messages);
-        return result;
-    }
-
-    public void Reset() { _history.Clear(); Status = AgentStatus.Idle; }
-}
+var llmMessages = histories
+    .OrderBy(m => m.CreatedAt)
+    .Select(m => m.Role == "user"
+        ? LlmMessage.UserText(m.Content)
+        : LlmMessage.AssistantText(m.Content))
+    .ToList();
 ```
 
-### 3.2 Domain layer — Chat session
-
-```
-Pharma.AiAssistant.Domain/
-  ChatSession/
-    ChatSession.cs         ← Entity: Id, UserId, Messages[], CreatedAt
-    ChatMessage.cs         ← Role, Content, CreatedAt
-  Interfaces/
-    IChatSessionRepository.cs
-```
-
-### 3.3 Infrastructure layer — Postgres persistence
-
-```
-Pharma.AiAssistant.Infrastructure/
-  Persistence/
-    AiDbContext.cs
-    ChatSessionRepository.cs    ← implements IChatSessionRepository
-    Migrations/
-```
-
-### 3.4 Application layer — ChatWithHistoryUseCase
-
-```csharp
-public async Task<ChatResponse> ExecuteAsync(ChatRequest request)
-{
-    // Load session hoặc tạo mới
-    var session = await _sessionRepo.GetOrCreateAsync(request.SessionId, request.UserId);
-
-    // Build history từ DB
-    var history = session.Messages
-        .Select(m => new LlmMessage(m.Role, [new TextBlock(m.Content)]))
-        .ToList();
-
-    // Chat (dùng Agent.PromptAsync thay vì RunAsync)
-    history.Add(LlmMessage.UserText(request.Message));
-    var result = await _agentRunner.RunAsync(history);
-
-    // Lưu lại
-    session.AddMessage("user", request.Message);
-    session.AddMessage("assistant", result.Output);
-    await _sessionRepo.SaveAsync(session);
-
-    return new ChatResponse(request.SessionId, result.Output);
-}
-```
-
-**Verify Phase 3:**
-```
-POST /api/chat { sessionId: "abc", message: "Warfarin liều tối đa?" }
-POST /api/chat { sessionId: "abc", message: "Còn với người già?" }
-→ Response lần 2 nhắc đến Warfarin (nhớ context)
-```
+**Known bug (fixed):** `GetConversationDetail` đã dùng `OrderByDescending(m => m.ConversationId)` → sai thứ tự. Fixed: `OrderBy(m => m.CreatedAt)`.
 
 ---
 
-## Phase 4 — RAG: Vector Search
+## Phase 4 — RAG: Vector Search ❌ Chưa bắt đầu
 
 **Goal:** SearchDrugTool thật sự query pgvector, trả về context liên quan.
 
@@ -340,14 +265,14 @@ Pharma.AiAssistant.Domain/
 ```
 Pharma.AiAssistant.Infrastructure/
   Ai/
-    Anthropic/
-      AnthropicEmbeddingService.cs   ← implements IEmbeddingService (hoặc dùng OpenAI)
+    Ollama/
+      OllamaEmbeddingService.cs   ← implements IEmbeddingService (POST /api/embeddings)
   Persistence/
-    DrugKnowledgeRepository.cs      ← pgvector similarity search
-    Migrations/                      ← thêm vector column
+    DrugKnowledgeRepository.cs   ← pgvector similarity search
+    Migrations/                   ← thêm vector column
   Tools/
-    SearchDrugTool.cs               ← implement thật (thay NotImplementedException)
-    GetDrugInfoTool.cs              ← implement thật
+    SearchDrugTool.cs             ← implement thật (thay NotImplementedException)
+    GetDrugInfoTool.cs            ← implement thật
 ```
 
 ```csharp
@@ -355,14 +280,8 @@ Pharma.AiAssistant.Infrastructure/
 public async Task<ToolResult> ExecuteAsync(JsonObject input, CancellationToken ct)
 {
     var query = input["query"]!.GetValue<string>();
-
-    // 1. Embed câu hỏi thành vector
     var embedding = await _embeddingService.EmbedAsync(query, ct);
-
-    // 2. Similarity search trong pgvector
     var docs = await _drugRepo.SearchSimilarAsync(embedding, topK: 5, ct);
-
-    // 3. Format kết quả thành text cho LLM
     var context = string.Join("\n\n", docs.Select(d => $"[{d.DrugName}]\n{d.Content}"));
     return new ToolResult(input["_tool_use_id"]!.GetValue<string>(), context);
 }
@@ -378,7 +297,7 @@ Pharma.AiAssistant.Infrastructure/
 
 **Verify Phase 4:**
 ```
-POST /api/chat { message: "Warfarin tương tác với thuốc nào?" }
+POST /conversation/{id}/messages/stream { message: "Warfarin tương tác với thuốc nào?" }
 → LLM gọi search_drug("Warfarin interactions")
 → Tool query pgvector → trả về docs
 → LLM trả lời có context từ drug DB
@@ -386,7 +305,7 @@ POST /api/chat { message: "Warfarin tương tác với thuốc nào?" }
 
 ---
 
-## Phase 5 — Multi-Agent (TaskQueue + AgentPool + SharedMemory)
+## Phase 5 — Multi-Agent (TaskQueue + AgentPool + SharedMemory) ❌ Chưa bắt đầu
 
 **Goal:** Câu hỏi phức tạp → nhiều agents chạy song song, chia sẻ kết quả.
 
@@ -413,14 +332,14 @@ public event Action? AllCompleted;
 public void Complete(string taskId, string result)
 {
     Update(taskId, TaskStatus.Completed, result);
-    UnblockDependents(taskId);   // scan blocked tasks, promote ready ones
+    UnblockDependents(taskId);
     if (IsComplete()) AllCompleted?.Invoke();
 }
 
 public void Fail(string taskId, string error)
 {
     Update(taskId, TaskStatus.Failed, error);
-    CascadeFailure(taskId);      // recursive fail downstream
+    CascadeFailure(taskId);
 }
 ```
 
@@ -428,12 +347,12 @@ public void Fail(string taskId, string error)
 // AgentPool.cs — double semaphore
 public async Task<RunResult> RunAsync(string agentName, string prompt)
 {
-    var agentLock = _agentLocks[agentName]; // SemaphoreSlim(1,1)
+    var agentLock = _agentLocks[agentName];
 
-    await agentLock.WaitAsync();            // [1] per-agent lock trước
+    await agentLock.WaitAsync();
     try
     {
-        await _poolSemaphore.WaitAsync();   // [2] pool-wide limit sau
+        await _poolSemaphore.WaitAsync();
         try   { return await _agents[agentName].RunAsync(prompt); }
         finally { _poolSemaphore.Release(); }
     }
@@ -444,20 +363,19 @@ public async Task<RunResult> RunAsync(string agentName, string prompt)
 ### 5.2 Application layer — MultiAgentAnalysisUseCase
 
 ```csharp
-// Dùng trực tiếp TaskQueue + AgentPool, chưa có Coordinator
 public async Task<string> ExecuteAsync(IReadOnlyList<AgentTask> tasks)
 {
     var memory = new SharedMemory();
     var queue  = new TaskQueue();
 
-    queue.on('task:ready', async (task) => {
+    queue.TaskReady += async task => {
         var context = await memory.GetSummaryAsync(task.DependsOn);
         var prompt  = $"{task.Prompt}\n\nContext:\n{context}";
         var result  = await _pool.RunAsync(task.Assignee, prompt);
 
         await memory.WriteAsync(task.Assignee, $"task:{task.Id}:result", result.Output);
         queue.Complete(task.Id, result.Output);
-    });
+    };
 
     queue.AddBatch(tasks);
     await queue.WaitAllAsync();
@@ -468,18 +386,16 @@ public async Task<string> ExecuteAsync(IReadOnlyList<AgentTask> tasks)
 
 **Verify Phase 5:**
 ```
-Tạo task list thủ công:
-  Task A: Tìm Warfarin info (drug-retriever)
-  Task B: Tìm Amiodarone info (drug-retriever)
-  Task C: Phân tích tương tác (dependsOn: A, B) (analyst)
-
+Task A: Tìm Warfarin info (drug-retriever)
+Task B: Tìm Amiodarone info (drug-retriever)
+Task C: Phân tích tương tác (dependsOn: A, B) (analyst)
 → A và B chạy song song
 → C tự unblock khi A+B xong, có context từ SharedMemory
 ```
 
 ---
 
-## Phase 6 — Coordinator + Orchestrator (Killer Feature)
+## Phase 6 — Coordinator + Orchestrator ❌ Chưa bắt đầu
 
 **Goal:** User hỏi ngôn ngữ tự nhiên → Coordinator tự sinh task list → chạy.
 
@@ -500,13 +416,13 @@ public async Task<string> RunTeamAsync(string goal)
 {
     // [1] Coordinator LLM → sinh task list
     var coordinator = _agentFactory.CreateCoordinator(_availableAgents);
-    var plan = await coordinator.RunAsync(goal);     // output là JSON TaskList
+    var plan = await coordinator.RunAsync(goal);
     var tasks = JsonSerializer.Deserialize<List<AgentTask>>(plan.Output)!;
 
     // [2] Chạy qua TaskQueue + AgentPool (Phase 5)
     var result = await _multiAgentUseCase.ExecuteAsync(tasks);
 
-    // [3] Coordinator synthesize final answer
+    // [3] Synthesize final answer
     var finalPrompt = $"Goal: {goal}\n\nResults:\n{result}\n\nSynthesize a final answer.";
     var finalResult = await coordinator.RunAsync(finalPrompt);
 
@@ -526,7 +442,6 @@ POST /api/analyze
 
 **Verify Phase 6:**
 ```
-POST /api/analyze với câu hỏi phức tạp
 → Log thấy Coordinator sinh ra task list JSON
 → TaskQueue chạy đúng thứ tự
 → Final answer có quality cao hơn Phase 3 (single agent)
@@ -538,21 +453,15 @@ POST /api/analyze với câu hỏi phức tạp
 
 | Phase | Package |
 |-------|---------|
-| 1 | `Anthropic.SDK` hoặc `System.Net.Http.Json` |
-| 3 | `Microsoft.EntityFrameworkCore`, `Npgsql.EntityFrameworkCore.PostgreSQL` |
+| 1 (done) | `System.Net.Http.Json`, `MediatR`, `Npgsql.EntityFrameworkCore.PostgreSQL` |
 | 4 | `Pgvector.EntityFrameworkCore` |
 | All | `Microsoft.AspNetCore.OpenApi`, `Scalar.AspNetCore` |
 
 ---
 
-## Checklist bắt đầu Phase 1
+## Bước tiếp theo
 
-- [ ] Tạo solution + 4 projects
-- [ ] Copy `Directory.Build.props` từ identity-service
-- [ ] Tạo `ContentBlock`, `LlmMessage`, `LlmResponse`, `TokenUsage`
-- [ ] Tạo `ILlmAdapter` interface
-- [ ] Implement `AnthropicAdapter` (POST to api.anthropic.com/v1/messages)
-- [ ] Implement `AgentRunner` (while loop, không có tools)
-- [ ] Implement `SimpleChatUseCase`
-- [ ] Wire DI trong `Program.cs`
-- [ ] Test: `POST /api/chat { "message": "Xin chào" }` → nhận reply từ Claude
+1. **Implement `AgentRunner` + `RunResult` + `RunOptions`** (Phase 1.3 còn thiếu) — prerequisite cho mọi thứ tiếp theo
+2. Wire `AgentRunner` vào `StreamMessageHandler` để thay thế direct `llmAdapter.StreamAsync()` call
+3. Phase 2: Tools stubs (`IToolDefinition`, `ToolRegistry`, `IToolExecutor`, `SearchDrugTool`)
+4. Phase 4: RAG + pgvector
