@@ -12,13 +12,34 @@
 | Phase | Mô tả | Trạng thái |
 |-------|-------|-----------|
 | 1 | Core types + ILlmAdapter + OllamaAdapter + basic chat | ✅ Done (diverged — xem chi tiết) |
-| 2 | Tools infrastructure | ❌ Chưa bắt đầu |
-| 3 | Chat history (multi-turn) | ✅ Done (diverged — xem chi tiết) |
-| 4 | RAG + pgvector | ❌ Chưa bắt đầu |
+| 2 | Tools infrastructure + AgentRunner | ✅ Done (diverged — xem chi tiết) |
+| 3 | Chat history (multi-turn) + sliding window summary | ✅ Done (diverged — xem chi tiết) |
+| 4 | RAG + Qdrant search | ⏳ Next |
 | 5 | Multi-agent (TaskQueue + AgentPool) | ❌ Chưa bắt đầu |
 | 6 | Coordinator + Orchestrator | ❌ Chưa bắt đầu |
 
-**`AgentRunner` chưa implement** — đây là nền của Phase 2–6. Phải làm trước khi tiếp tục.
+---
+
+## AgentRunner — ✅ Done
+
+Flow hiện tại (`AgentRunner.cs` tại Infrastructure/Services):
+```
+StreamMessageHandler → agentRunner.StreamAsync()
+                           ↓
+                    while (có tool call):
+                        llmAdapter.StreamAsync()    ← stream từng turn, collect ToolUseBlock
+                        toolExecutor.ExecuteAsync() ← parallel Task.WhenAll
+                        yield ToolResultEvent → feed back vào conversation
+                           ↓
+                    turn cuối (không có tool call):
+                        yield TextChunk + DoneEvent
+```
+
+Divergence thực tế so với plan gốc:
+- Stream **từng turn** (không phải ChatAsync + StreamAsync cuối) → user thấy thinking realtime
+- `AgentRunner` nằm ở **Infrastructure** (không phải Domain) vì depend vào `ILlmAdapter`
+- `IAgentRunner` chỉ có `StreamAsync` (không có `RunAsync`) — đủ cho use case hiện tại
+- Tool execution error bị **catch**, trả về error message thay vì crash → agent tiếp tục
 
 ---
 
@@ -141,71 +162,19 @@ SSE format: `data: {json_string}\n\n` per chunk, kết thúc bằng `data: [DONE
 
 ---
 
-## Phase 2 — Tools Infrastructure ❌ Chưa bắt đầu
+## Phase 2 — Tools Infrastructure ✅ Done
 
-**Dependency:** Cần implement `AgentRunner` (Phase 1.3) trước.
+**Divergence từ plan gốc:** `IToolDefinition` nằm ở **Infrastructure** (không phải Domain). `ToolExecutionResult` nằm ở Application/Models. Tools wired vào DI trong `DependencyInjection.cs`.
 
-**Goal:** LLM có thể "gọi tool", AgentRunner execute tool thật (dù tool chưa có logic RAG).
+Files đã có:
+- `Infrastructure/Tools/IToolDefinition.cs` — `Name`, `Description`, `InputSchema`, `ExecuteAsync`
+- `Infrastructure/Tools/ToolRegistry.cs` — `Register` / `GetAll` / `GetByName`
+- `Application/Services/IToolExecutor.cs` — `Task<ToolExecutionResult> ExecuteAsync(ToolUseBlock, ...)`
+- `Infrastructure/Tools/ToolExecutor.cs` — dispatch đến tool đúng tên
+- `Infrastructure/Tools/SearchDrugTool.cs` — stub, `throw NotImplementedException("Phase 4")`
+- `Infrastructure/Tools/GetDrugInfoTool.cs` — stub, `throw NotImplementedException("Phase 4")`
 
-### 2.1 Domain layer — Tool contracts
-
-```
-Pharma.AiAssistant.Domain/
-  Ai/
-    Tools/
-      IToolDefinition.cs    ← Name, Description, InputSchema (JsonObject)
-      ToolResult.cs         ← record ToolResult(string ToolUseId, string Output, bool IsError)
-      ToolRegistry.cs       ← Register / GetAll / GetByName
-  Interfaces/
-    IToolExecutor.cs        ← Task<ToolResult> ExecuteAsync(ToolUseBlock block, ...)
-```
-
-### 2.2 Infrastructure layer — Tool implementations (stubs)
-
-```
-Pharma.AiAssistant.Infrastructure/
-  Tools/
-    SearchDrugTool.cs       ← implements IToolDefinition, ExecuteAsync → throw NotImplementedException (Phase 4)
-    GetDrugInfoTool.cs      ← implements IToolDefinition, ExecuteAsync → throw NotImplementedException (Phase 4)
-    ToolExecutor.cs         ← implements IToolExecutor, dispatch đến đúng tool
-```
-
-```csharp
-// SearchDrugTool.cs
-public sealed class SearchDrugTool : IToolDefinition
-{
-    public string Name => "search_drug";
-    public string Description => "Tìm kiếm thông tin thuốc từ cơ sở dữ liệu dược phẩm";
-    public JsonObject InputSchema => ...; // { query: string }
-
-    public Task<ToolResult> ExecuteAsync(JsonObject input, CancellationToken ct)
-        => throw new NotImplementedException("Vector search — implement in Phase 4");
-}
-```
-
-### 2.3 AgentRunner — bổ sung tool execution
-
-```csharp
-// Thay thế NotImplementedException ở Phase 1:
-var executions = await Task.WhenAll(
-    toolUseBlocks.Select(b => _toolExecutor.ExecuteAsync(b, options.CancellationToken))
-);
-
-var resultBlocks = executions
-    .Select(e => (ContentBlock)new ToolResultBlock(e.ToolUseId, e.Output, e.IsError))
-    .ToList();
-
-conversation.Add(new LlmMessage("user", resultBlocks));
-// → loop lại, LLM đọc tool results
-```
-
-**Verify Phase 2:**
-```
-Hỏi câu khiến LLM muốn gọi search_drug
-→ Log thấy ToolUseBlock được nhận
-→ NotImplementedException throw (expected ở phase này)
-→ Chứng tỏ flow tool call đúng
-```
+Tool error hiện tại bị catch ở `AgentRunner` → trả error message về LLM, không crash.
 
 ---
 
@@ -245,62 +214,184 @@ var llmMessages = histories
 
 ---
 
-## Phase 4 — RAG: Vector Search ❌ Chưa bắt đầu
+## Phase 4 — RAG: Qdrant Search ⏳ Next
 
-**Goal:** SearchDrugTool thật sự query pgvector, trả về context liên quan.
+**Goal:** Tools thật sự query Qdrant, trả về context từ drug PDF đã được index bởi pharma-document-service.
 
-### 4.1 Domain layer — Drug document
+**Context quan trọng:**
+- Vector store: **Qdrant** (không phải pgvector) — pharma-document-service đã index sẵn
+- Embedding model: **OpenAI** (`text-embedding-3-small`, 1536 dim) — phải dùng cùng model với document-service, không dùng Ollama
+- Collection naming: `drug-class-{slug}` — 1 collection per drug class
+- Payload per chunk: `chunkText`, `drugName`, `drugClassId`, `documentId`, `fileName`, `chunkIndex`
+- AI assistant **không** cần ingest data — document-service đã xử lý toàn bộ pipeline PDF → chunk → embed → Qdrant
+
+### 4.1 Tool redesign
+
+**Xóa** `GetDrugInfoTool` — duplicate logic, `info_type` enum không map được vào cách Qdrant lưu trữ.
+
+**Update** `SearchDrugTool` schema:
+
+```csharp
+public string Name => "search_drug";
+public string Description => "Search pharmaceutical knowledge base for drug information. Use specific queries for best results (e.g. 'Warfarin dosage elderly renal failure').";
+public JsonObject InputSchema => new()
+{
+    ["type"] = "object",
+    ["properties"] = new JsonObject
+    {
+        ["query"] = new JsonObject
+        {
+            ["type"] = "string",
+            ["description"] = "Semantic search query — be specific (drug name + topic)"
+        },
+        ["drug_class"] = new JsonObject
+        {
+            ["type"] = "string",
+            ["description"] = "Optional drug class slug to narrow search (from list_drug_classes). Omit to search all classes."
+        }
+    },
+    ["required"] = new JsonArray { "query" }
+};
+```
+
+**Thêm** `ListDrugClassesTool`:
+
+```csharp
+public string Name => "list_drug_classes";
+public string Description => "List all available drug classes in the knowledge base. Call this first when you don't know which drug class to search in.";
+public JsonObject InputSchema => new() { ["type"] = "object", ["properties"] = new JsonObject() };
+// ExecuteAsync → qdrantClient.ListCollectionsAsync() → strip "drug-class-" prefix
+```
+
+### 4.2 SharedKernel — IEmbeddingService (prerequisite)
+
+`IEmbeddingService` hiện đang nằm ở `Pharma.Document.Application/Services/` — cần **move lên SharedKernel** để ai-assistant-service dùng chung, tránh define lại interface trùng.
 
 ```
-Pharma.AiAssistant.Domain/
-  DrugKnowledge/
-    DrugDocument.cs          ← Id, DrugName, Content, Embedding (float[])
+Pharma.SharedKernel.Application/
   Interfaces/
-    IDrugKnowledgeRepository.cs   ← SearchSimilarAsync(float[] embedding, int topK)
-    IEmbeddingService.cs          ← Task<float[]> EmbedAsync(string text)
+    IEmbeddingService.cs      ← move từ document-service (giữ nguyên contract)
 ```
 
-### 4.2 Infrastructure layer
+```csharp
+// Giữ nguyên contract — chỉ đổi namespace
+public interface IEmbeddingService
+{
+    Task<float[]> GenerateEmbeddingAsync(string text, CancellationToken cancellationToken);
+    Task<IReadOnlyList<float[]>> GenerateEmbeddingsAsync(IEnumerable<string> texts, CancellationToken cancellationToken = default);
+}
+```
+
+Sau khi move:
+- `Pharma.Document.Application` → update using sang `Pharma.SharedKernel.Application.Interfaces`
+- `Pharma.Document.Infrastructure/Services/EmbeddingService.cs` → implement từ SharedKernel interface
+
+### 4.3 Application layer — interfaces
+
+```
+Pharma.AiAssistant.Application/
+  Services/
+    IVectorSearchService.cs   ← Task<IReadOnlyList<SearchResult>> SearchAsync(float[] vector, string? collection, int topK, ...)
+                                 Task<IReadOnlyList<string>> ListCollectionsAsync(...)
+```
+
+> `IEmbeddingService` lấy từ `Pharma.SharedKernel.Application.Interfaces` — không tạo mới.
+
+```csharp
+public record SearchResult(string ChunkText, string DrugName, string FileName, float Score);
+```
+
+### 4.4 Infrastructure layer
 
 ```
 Pharma.AiAssistant.Infrastructure/
-  Ai/
-    Ollama/
-      OllamaEmbeddingService.cs   ← implements IEmbeddingService (POST /api/embeddings)
-  Persistence/
-    DrugKnowledgeRepository.cs   ← pgvector similarity search
-    Migrations/                   ← thêm vector column
+  Services/
+    OpenAiEmbeddingService.cs     ← implements SharedKernel.IEmbeddingService, dùng OpenAI.Embeddings SDK
+    QdrantVectorSearchService.cs  ← implements IVectorSearchService, dùng Qdrant.Client SDK
   Tools/
-    SearchDrugTool.cs             ← implement thật (thay NotImplementedException)
-    GetDrugInfoTool.cs            ← implement thật
+    SearchDrugTool.cs             ← inject IEmbeddingService + IVectorSearchService, implement thật
+    ListDrugClassesTool.cs        ← inject IVectorSearchService, gọi ListCollectionsAsync
+    GetDrugInfoTool.cs            ← XÓA
+```
+
+```csharp
+// QdrantVectorSearchService.cs
+public async Task<IReadOnlyList<SearchResult>> SearchAsync(float[] vector, string? collection, int topK, CancellationToken ct)
+{
+    var collections = collection is not null
+        ? [$"drug-class-{collection}"]
+        : (await _client.ListCollectionsAsync(ct)).Select(c => c.Name).ToList();
+
+    var results = new List<SearchResult>();
+    foreach (var col in collections)
+    {
+        var hits = await _client.SearchAsync(col, vector, limit: (ulong)topK, cancellationToken: ct);
+        results.AddRange(hits.Select(h => new SearchResult(
+            ChunkText: h.Payload["chunkText"].StringValue,
+            DrugName: h.Payload["drugName"].StringValue,
+            FileName: h.Payload["fileName"].StringValue,
+            Score: h.Score)));
+    }
+
+    return results.OrderByDescending(r => r.Score).Take(topK).ToList();
+}
 ```
 
 ```csharp
 // SearchDrugTool.cs — implement thật
-public async Task<ToolResult> ExecuteAsync(JsonObject input, CancellationToken ct)
+public async Task<ToolExecutionResult> ExecuteAsync(string toolUseId, JsonObject input, CancellationToken ct)
 {
     var query = input["query"]!.GetValue<string>();
-    var embedding = await _embeddingService.EmbedAsync(query, ct);
-    var docs = await _drugRepo.SearchSimilarAsync(embedding, topK: 5, ct);
-    var context = string.Join("\n\n", docs.Select(d => $"[{d.DrugName}]\n{d.Content}"));
-    return new ToolResult(input["_tool_use_id"]!.GetValue<string>(), context);
+    var drugClass = input["drug_class"]?.GetValue<string>();
+
+    var vector = await _embeddingService.GenerateEmbeddingAsync(query, ct);
+    var results = await _vectorSearchService.SearchAsync(vector, drugClass, topK: 5, ct);
+
+    if (results.Count == 0)
+        return new ToolExecutionResult(toolUseId, "No relevant drug information found.", IsError: false);
+
+    var context = string.Join("\n\n", results.Select(r =>
+        $"[{r.DrugName} — {r.FileName}] (score: {r.Score:F2})\n{r.ChunkText}"));
+
+    return new ToolExecutionResult(toolUseId, context, IsError: false);
 }
 ```
 
-### 4.3 Data ingestion script
+### 4.5 DI wiring
+
+```csharp
+// DependencyInjection.cs — thêm vào LLM Configuration block
+var openAiApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")!;
+services.AddSingleton(new EmbeddingClient("text-embedding-3-small", openAiApiKey));
+services.AddSingleton<IEmbeddingService, OpenAiEmbeddingService>();
+
+var qdrantHost = Environment.GetEnvironmentVariable("QDRANT_HOST") ?? "localhost";
+var qdrantPort = int.TryParse(Environment.GetEnvironmentVariable("QDRANT_PORT"), out var qp) ? qp : 6334;
+services.AddSingleton(new QdrantClient(qdrantHost, qdrantPort));
+services.AddSingleton<IVectorSearchService, QdrantVectorSearchService>();
+
+// Tools — thay GetDrugInfoTool bằng ListDrugClassesTool
+toolRegistry.Register(new SearchDrugTool(...));   // inject services qua constructor
+toolRegistry.Register(new ListDrugClassesTool(...));
+// XÓA: toolRegistry.Register(new GetDrugInfoTool());
+```
+
+### 4.6 NuGet packages cần thêm
 
 ```
-Pharma.AiAssistant.Infrastructure/
-  Seeding/
-    DrugKnowledgeSeedService.cs   ← đọc drug data → embed → lưu vào pgvector
+Qdrant.Client
+OpenAI  (đã có ở document-service, thêm vào ai-assistant-service)
 ```
 
-**Verify Phase 4:**
+### 4.7 Verify Phase 4
+
 ```
-POST /conversation/{id}/messages/stream { message: "Warfarin tương tác với thuốc nào?" }
-→ LLM gọi search_drug("Warfarin interactions")
-→ Tool query pgvector → trả về docs
-→ LLM trả lời có context từ drug DB
+1. Upload 1 PDF lên document-service → đợi status = Completed
+2. POST /conversation/{id}/messages/stream { message: "Warfarin tương tác với Amiodarone?" }
+   → Log thấy LLM gọi list_drug_classes → thấy collections
+   → LLM gọi search_drug("Warfarin Amiodarone interaction", drug_class="anticoagulants")
+   → Tool query Qdrant → trả về chunks
+   → LLM trả lời có context từ PDF
 ```
 
 ---
@@ -453,15 +544,21 @@ POST /api/analyze
 
 | Phase | Package |
 |-------|---------|
-| 1 (done) | `System.Net.Http.Json`, `MediatR`, `Npgsql.EntityFrameworkCore.PostgreSQL` |
-| 4 | `Pgvector.EntityFrameworkCore` |
+| 1–3 (done) | `System.Net.Http.Json`, `MediatR`, `Npgsql.EntityFrameworkCore.PostgreSQL` |
+| 4 | `Qdrant.Client`, `OpenAI` |
 | All | `Microsoft.AspNetCore.OpenApi`, `Scalar.AspNetCore` |
 
 ---
 
 ## Bước tiếp theo
 
-1. **Implement `AgentRunner` + `RunResult` + `RunOptions`** (Phase 1.3 còn thiếu) — prerequisite cho mọi thứ tiếp theo
-2. Wire `AgentRunner` vào `StreamMessageHandler` để thay thế direct `llmAdapter.StreamAsync()` call
-3. Phase 2: Tools stubs (`IToolDefinition`, `ToolRegistry`, `IToolExecutor`, `SearchDrugTool`)
-4. Phase 4: RAG + pgvector
+1. **Phase 4 — RAG:**
+   - Move `IEmbeddingService` từ `Pharma.Document.Application/Services/` → `Pharma.SharedKernel.Application/Interfaces/`, update usings ở document-service
+   - Xóa `GetDrugInfoTool`
+   - Update `SearchDrugTool` schema (thêm `drug_class` optional param)
+   - Thêm `ListDrugClassesTool`
+   - Thêm `IVectorSearchService` + `QdrantVectorSearchService` + `OpenAiEmbeddingService` (implement SharedKernel interface)
+   - Implement `SearchDrugTool.ExecuteAsync` và `ListDrugClassesTool.ExecuteAsync`
+   - Wire DI: OpenAI embedding client + QdrantClient + env vars
+2. Phase 5: Multi-agent (TaskQueue + AgentPool + SharedMemory)
+3. Phase 6: Coordinator + Orchestrator
