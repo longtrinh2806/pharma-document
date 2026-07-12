@@ -9,30 +9,40 @@
 
 ## Trạng thái tổng quan
 
+_Cập nhật 2026-07-11 — scan trực tiếp code, không dựa vào draft cũ._
+
 | Phase | Mô tả | Trạng thái |
 |-------|-------|-----------|
 | 1 | Core types + ILlmAdapter + OllamaAdapter + basic chat | ✅ Done (diverged — xem chi tiết) |
 | 2 | Tools infrastructure + AgentRunner | ✅ Done (diverged — xem chi tiết) |
 | 3 | Chat history (multi-turn) + sliding window summary | ✅ Done (diverged — xem chi tiết) |
-| 4 | RAG + Qdrant search | ⏳ Next |
-| 5 | Multi-agent (TaskQueue + AgentPool) | ❌ Chưa bắt đầu |
-| 6 | Coordinator + Orchestrator | ❌ Chưa bắt đầu |
+| 4 | RAG + Qdrant search | ✅ **Done** (trước đây ghi nhầm ⏳ Next — xem chi tiết) |
+| 5 | Self-Correction (grade → rewrite → retry → fallback → escalate) | ❌ Chưa bắt đầu — chưa có file nào |
+| 6 | Multi-agent (TaskQueue + AgentPool) | ❌ Chưa bắt đầu — chưa có file nào |
+| 7 | Coordinator + Orchestrator | ❌ Chưa bắt đầu — chưa có file nào |
+
+⚠️ **Security flag:** `OPENAI_API_KEY` thật (dạng `sk-proj-...`) đang hard-code trong `Pharma.AiAssistant.API/Properties/launchSettings.json` — file này thường bị commit vào git. Nên chuyển sang user-secrets/env thật và rotate key nếu đã từng push lên remote.
 
 ---
 
 ## AgentRunner — ✅ Done
 
-Flow hiện tại (`AgentRunner.cs` tại Infrastructure/Services):
+File thực tế: `Pharma.AiAssistant.Infrastructure/Services/AgentRunner.cs`, implement `IAgentRunner` (`Pharma.AiAssistant.Application/Services/IAgentRunner.cs` — chỉ có `StreamAsync(IList<LlmMessage>, ct) : IAsyncEnumerable<StreamEvent>`, không có `RunAsync`).
+
+Flow hiện tại:
 ```
 StreamMessageHandler → agentRunner.StreamAsync()
                            ↓
-                    while (có tool call):
-                        llmAdapter.StreamAsync()    ← stream từng turn, collect ToolUseBlock
-                        toolExecutor.ExecuteAsync() ← parallel Task.WhenAll
-                        yield ToolResultEvent → feed back vào conversation
-                           ↓
-                    turn cuối (không có tool call):
-                        yield TextChunk + DoneEvent
+                    while (turns++ < ChatOptions.MaxTurns):     ← mặc định 10, env LLM_MAX_TURNS
+                        llmAdapter.StreamAsync()                 ← stream từng turn, forward ThinkingChunk/TextChunk ngay
+                        collect ToolUseBlock[]
+                        nếu KHÔNG có tool call → append assistant message, yield DoneEvent(RunResult), return
+                        nếu CÓ tool call →
+                            Task.WhenAll(toolExecutor.ExecuteAsync)  ← parallel, catch lỗi từng tool riêng
+                            yield ToolResultEvent (+ SourcesEvent nếu tool trả citation)
+                            append "user" message chứa ToolResultBlock[] → conversation
+                            loop tiếp
+                    hết MaxTurns mà chưa có turn cuối → log warning, yield DoneEvent rỗng
 ```
 
 Divergence thực tế so với plan gốc:
@@ -40,6 +50,8 @@ Divergence thực tế so với plan gốc:
 - `AgentRunner` nằm ở **Infrastructure** (không phải Domain) vì depend vào `ILlmAdapter`
 - `IAgentRunner` chỉ có `StreamAsync` (không có `RunAsync`) — đủ cho use case hiện tại
 - Tool execution error bị **catch**, trả về error message thay vì crash → agent tiếp tục
+- `RunOptions` như plan gốc mô tả **không tồn tại** — cấu hình turns/model/thinking nằm ở `ChatOptions` (Application/Models), build 1 lần thành singleton trong DI
+- `StreamEvent` (Domain/Ai) là base type polymorphic (`[JsonPolymorphic]`, discriminator `"type"`) với các variant: `TextChunk`, `ThinkingChunk`, `ToolUseEvent`, `ToolResultEvent`, `SourcesEvent(IReadOnlyList<Source>)`, `DoneEvent(RunResult)` — `Source(DrugName, FileName, Score, ChunkText)` dùng để trả citation chip về UI khi RAG tool trả kết quả
 
 ---
 
@@ -195,39 +207,53 @@ Tool error hiện tại bị catch ở `AgentRunner` → trả error message v�
 - `ConversationConfiguration.cs`, `MessageConfiguration.cs`
 - Migration: `20260613121810_Initial.cs`
 
-### ✅ Multi-turn history
+### ✅ Multi-turn history + windowed summarization (diverge đáng kể so với plan gốc)
 
-`StreamMessageHandler` build history từ DB trước mỗi request:
-```csharp
-var histories = await messageRepository.FindAsync(
-    m => m.ConversationId == conversationId, cancellationToken);
+`Conversation` entity có thêm 2 field (2 migration sau Initial):
+- `20260616161951_AddConversationSummary` → `Conversation.Summary (string?)`
+- `20260627160926_AlterTableConversationAddSummarizedUpToCount` → `Conversation.SummarizedUpToCount (int)`
 
-var llmMessages = histories
-    .OrderBy(m => m.CreatedAt)
-    .Select(m => m.Role == "user"
-        ? LlmMessage.UserText(m.Content)
-        : LlmMessage.AssistantText(m.Content))
-    .ToList();
-```
+`StreamMessageHandler.TrySummarizeAsync`: khi `messageCount >= SummarizedUpToCount + WindowSize(20) + SummarizeThreshold(20)` → gọi `llmAdapter.ChatAsync` để tóm tắt các message cũ, ghi vào `Conversation.Summary` + cập nhật `SummarizedUpToCount`. Khi build `llmMessages` cho mỗi request: prepend `Summary` như 1 synthetic user message + lấy 20 message gần nhất — không load toàn bộ history mỗi lần như plan gốc mô tả.
 
 **Known bug (fixed):** `GetConversationDetail` đã dùng `OrderByDescending(m => m.ConversationId)` → sai thứ tự. Fixed: `OrderBy(m => m.CreatedAt)`.
 
 ---
 
-## Phase 4 — RAG: Qdrant Search ⏳ Next
+## Phase 4 — RAG: Qdrant Search ✅ Done
+
+**Verify thực tế (2026-07-11):** đã implement đầy đủ, không còn stub. Chi tiết bên dưới phản ánh code thật, không phải kế hoạch nữa.
+
+### Kết quả thực tế
+
+- `IEmbeddingService` **đã** move vào `Pharma.SharedKernel.Application.Interfaces` (đúng như plan) — `SearchDrugTool` và `StreamMessageHandler` import trực tiếp từ đó. Không có `OpenAiEmbeddingService.cs` riêng trong ai-assistant-service — implementation nằm trong SharedKernel package. Infrastructure chỉ đăng ký raw `OpenAI.Embeddings.EmbeddingClient` singleton (`OPENAI_EMBEDDING_MODEL`, mặc định `text-embedding-3-small`).
+- `Pharma.AiAssistant.Application/Services/IVectorSearchService.cs` — `ListCollectionsAsync()`, `SearchAsync(vector, collection?, topK, ct)`.
+- `Pharma.AiAssistant.Infrastructure/Services/QdrantVectorSearchService.cs` — implement thật, dùng `Qdrant.Client 1.18.1`:
+  - `ListCollectionsAsync` → delegate thẳng `QdrantClient.ListCollectionsAsync`
+  - `SearchAsync`: nếu có `collection` → chỉ search `drug-class-{collection}`; nếu không → search **tất cả** collections rồi merge + sort theo score, lấy topK
+  - Catch `RpcException(NotFound)` riêng từng collection (đúng theo edge-case đã note trong plan gốc) → coi như không có kết quả thay vì crash
+- `Infrastructure/Tools/SearchDrugTool.cs` — **implement đầy đủ**: validate `query` → `embeddingService.GenerateEmbeddingAsync` → `vectorSearchService.SearchAsync(vector, drugClass, topK:5)` → format context text + build `Source[]` cho `SourcesEvent` (citation chip trả về UI)
+- `Infrastructure/Tools/ListDrugClassesTool.cs` — **implement đầy đủ**: đã đổi sang `IVectorSearchService.ListCollectionsAsync()` + strip prefix `drug-class-` như plan, **không còn** `HttpClient`/`IHttpContextAccessor` gọi document-service
+- DI (`Pharma.AiAssistant.Infrastructure/DependencyInjection.cs`): `QdrantClient` singleton (`QDRANT_HOST`, `QDRANT_PORT`, `QDRANT_API_KEY`) → `IVectorSearchService`; cả 2 tool đăng ký singleton vào `ToolRegistry`; `IEmbeddingService` binding đến từ `services.AddSharedInfrastructure()` (SharedKernel) gọi ở cuối method
+- `local.props` (không phải `.example`) đã tồn tại ở solution root với `UseLocalSharedKernel=true` — `.csproj` của Application/Infrastructure reference NuGet `Pharma.SharedKernel.Application 1.0.6` / `Pharma.SharedKernel.Infrastructure 1.0.7` khi không dùng local
+
+### Phần dưới đây là nội dung plan gốc — giữ lại để tham khảo lịch sử, đã match với code thật
 
 **Goal:** Tools thật sự query Qdrant, trả về context từ drug PDF đã được index bởi pharma-document-service.
 
 **Context quan trọng:**
 - Vector store: **Qdrant** (không phải pgvector) — pharma-document-service đã index sẵn
 - Embedding model: **OpenAI** (`text-embedding-3-small`, 1536 dim) — phải dùng cùng model với document-service, không dùng Ollama
-- Collection naming: `drug-class-{slug}` — 1 collection per drug class
-- Payload per chunk: `chunkText`, `drugName`, `drugClassId`, `documentId`, `fileName`, `chunkIndex`
+- Collection naming: `drug-class-{slug}` — 1 collection per drug class (verify: `BuildCollectionName` trong `DocumentUploadedConsumer.cs`, document-service)
+- Payload per chunk (verify đúng key names trong code, không phải giả định): `documentId`, `chunkIndex`, `chunkText`, `fileName`, `drugName`, `drugClassId`
 - AI assistant **không** cần ingest data — document-service đã xử lý toàn bộ pipeline PDF → chunk → embed → Qdrant
+- Qdrant DI ở document-service truyền cả `apiKey` (env `QDRANT_API_KEY`, đã set trong `infrastructure/infra/.env`) — ai-assistant-service **phải truyền theo**, không thì bị reject request
+
+**Đã verify vs code thực tế (khác so với draft ban đầu của plan này):**
+- `GetDrugInfoTool` **không tồn tại** trong code — không có gì để xóa.
+- `ListDrugClassesTool` **đã tồn tại**, nhưng hiện gọi HTTP sang document-service (`GET api/documentclass`, forward Authorization header qua `IHttpContextAccessor`). Quyết định: đổi sang query Qdrant trực tiếp (`ListCollectionsAsync`, strip prefix `drug-class-`) — bỏ HTTP client/`IHttpContextAccessor` dependency, tool query cùng nguồn dữ liệu với `search_drug`.
+- `QdrantVectorStoreService` bên document-service (dùng cho write path — `EnsureCollectionExistsAsync`, `UpsertBatchAsync`) **không có method search**, và nằm ở solution riêng — ai-assistant-service phải tự viết read-path riêng bằng `Qdrant.Client`, không tái sử dụng được service class đó.
 
 ### 4.1 Tool redesign
-
-**Xóa** `GetDrugInfoTool` — duplicate logic, `info_type` enum không map được vào cách Qdrant lưu trữ.
 
 **Update** `SearchDrugTool` schema:
 
@@ -254,13 +280,13 @@ public JsonObject InputSchema => new()
 };
 ```
 
-**Thêm** `ListDrugClassesTool`:
+**Update** `ListDrugClassesTool` (đã tồn tại, đổi implementation): bỏ `HttpClient` + `IHttpContextAccessor` (gọi document-service), thay bằng inject `IVectorSearchService`:
 
 ```csharp
 public string Name => "list_drug_classes";
 public string Description => "List all available drug classes in the knowledge base. Call this first when you don't know which drug class to search in.";
 public JsonObject InputSchema => new() { ["type"] = "object", ["properties"] = new JsonObject() };
-// ExecuteAsync → qdrantClient.ListCollectionsAsync() → strip "drug-class-" prefix
+// ExecuteAsync → vectorSearchService.ListCollectionsAsync() → strip "drug-class-" prefix
 ```
 
 ### 4.2 SharedKernel — IEmbeddingService (prerequisite)
@@ -292,7 +318,7 @@ Sau khi move:
 Pharma.AiAssistant.Application/
   Services/
     IVectorSearchService.cs   ← Task<IReadOnlyList<SearchResult>> SearchAsync(float[] vector, string? collection, int topK, ...)
-                                 Task<IReadOnlyList<string>> ListCollectionsAsync(...)
+                                 Task<IReadOnlyList<string>> ListCollectionsAsync(...)  ← dùng chung bởi ListDrugClassesTool
 ```
 
 > `IEmbeddingService` lấy từ `Pharma.SharedKernel.Application.Interfaces` — không tạo mới.
@@ -310,8 +336,7 @@ Pharma.AiAssistant.Infrastructure/
     QdrantVectorSearchService.cs  ← implements IVectorSearchService, dùng Qdrant.Client SDK
   Tools/
     SearchDrugTool.cs             ← inject IEmbeddingService + IVectorSearchService, implement thật
-    ListDrugClassesTool.cs        ← inject IVectorSearchService, gọi ListCollectionsAsync
-    GetDrugInfoTool.cs            ← XÓA
+    ListDrugClassesTool.cs        ← đổi inject: bỏ HttpClient/IHttpContextAccessor, dùng IVectorSearchService.ListCollectionsAsync
 ```
 
 ```csharp
@@ -320,7 +345,7 @@ public async Task<IReadOnlyList<SearchResult>> SearchAsync(float[] vector, strin
 {
     var collections = collection is not null
         ? [$"drug-class-{collection}"]
-        : (await _client.ListCollectionsAsync(ct)).Select(c => c.Name).ToList();
+        : await _client.ListCollectionsAsync(ct); // trả về IReadOnlyList<string>, không phải object có .Name
 
     var results = new List<SearchResult>();
     foreach (var col in collections)
@@ -336,6 +361,8 @@ public async Task<IReadOnlyList<SearchResult>> SearchAsync(float[] vector, strin
     return results.OrderByDescending(r => r.Score).Take(topK).ToList();
 }
 ```
+
+Edge case cần xử lý: nếu `drug_class` do LLM truyền vào không map tới collection nào tồn tại, `SearchAsync` trên 1 collection sẽ throw (collection not found). Bọc try/catch quanh từng collection trong loop — coi như "no results" thay vì crash cả request, tương tự cách `AgentRunner` catch lỗi tool hiện tại.
 
 ```csharp
 // SearchDrugTool.cs — implement thật
@@ -360,20 +387,26 @@ public async Task<ToolExecutionResult> ExecuteAsync(string toolUseId, JsonObject
 ### 4.5 DI wiring
 
 ```csharp
-// DependencyInjection.cs — thêm vào LLM Configuration block
+// DependencyInjection.cs — thêm region "RAG Configuration"
 var openAiApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")!;
-services.AddSingleton(new EmbeddingClient("text-embedding-3-small", openAiApiKey));
+services.AddSingleton(_ => new EmbeddingClient("text-embedding-3-small", openAiApiKey));
 services.AddSingleton<IEmbeddingService, OpenAiEmbeddingService>();
 
 var qdrantHost = Environment.GetEnvironmentVariable("QDRANT_HOST") ?? "localhost";
 var qdrantPort = int.TryParse(Environment.GetEnvironmentVariable("QDRANT_PORT"), out var qp) ? qp : 6334;
-services.AddSingleton(new QdrantClient(qdrantHost, qdrantPort));
+services.AddSingleton(_ => new QdrantClient(
+    host: qdrantHost,
+    port: qdrantPort,
+    apiKey: Environment.GetEnvironmentVariable("QDRANT_API_KEY"))); // bắt buộc, giống document-service
 services.AddSingleton<IVectorSearchService, QdrantVectorSearchService>();
 
-// Tools — thay GetDrugInfoTool bằng ListDrugClassesTool
-toolRegistry.Register(new SearchDrugTool(...));   // inject services qua constructor
-toolRegistry.Register(new ListDrugClassesTool(...));
-// XÓA: toolRegistry.Register(new GetDrugInfoTool());
+// Tools Configuration — bỏ AddHttpClient<ListDrugClassesTool>(...) hiện có (không còn gọi HTTP nữa)
+toolRegistry.Register(new SearchDrugTool(
+    sp.GetRequiredService<IEmbeddingService>(),
+    sp.GetRequiredService<IVectorSearchService>()));
+toolRegistry.Register(new ListDrugClassesTool(
+    sp.GetRequiredService<IVectorSearchService>(),
+    sp.GetRequiredService<ILogger<ListDrugClassesTool>>()));
 ```
 
 ### 4.6 NuGet packages cần thêm
@@ -396,7 +429,151 @@ OpenAI  (đã có ở document-service, thêm vào ai-assistant-service)
 
 ---
 
-## Phase 5 — Multi-Agent (TaskQueue + AgentPool + SharedMemory) ❌ Chưa bắt đầu
+## Phase 5 — Self-Correction (Agentic RAG failure handling) ❌ Chưa bắt đầu
+
+**Nguồn cảm hứng:** Microsoft "Agentic RAG" self-correction pattern (`aka.ms/ai-agents-beginners`) — grade → rewrite → retry → fallback → escalate.
+
+**Đã scan code thật (2026-07-12)** để biết baseline trước khi thiết kế phase này — xem `AgentRunner.cs`, `SearchDrugTool.cs`, `QdrantVectorSearchService.cs`. Kết luận: hiện tại đã có "xương" (multi-turn tool loop, bounded bởi `MaxTurns`) nhưng **không có "não"** — mọi hành vi self-correction hiện tại chỉ là chỉ dẫn trong system prompt, không phải code:
+
+| Failure mode (theo sơ đồ Microsoft) | Trạng thái hiện tại | Bằng chứng |
+|---|---|---|
+| Grade retrieved docs | ❌ Không có | `SearchDrugTool.cs` trả raw top-K, không chấm điểm/lọc |
+| Rewrite Query | ❌ Không có | Chỉ có gợi ý trong system prompt, không có component rewrite |
+| New Search / retry có điều kiện | ⚠️ Một phần | Có turn-budget loop nhưng không "loop-until-good-enough"; hết turn → log warning, trả rỗng |
+| Try Alternative Source | ⚠️ Một phần | Chỉ prompt-level: bảo LLM tự trả lời bằng kiến thức chung nếu tool rỗng/lỗi |
+| Request Human Help | ❌ Không có | Không có confidence scoring/flag/escalation path |
+| Tracing/observability | ❌ Tắt | Aspire `ServiceDefaults` (OpenTelemetry) bị comment `#if DEBUG` trong `Program.cs` |
+| Malformed query validation | ⚠️ Một phần | Chỉ check null/whitespace |
+
+**Goal:** Biến `SearchDrugTool` + `AgentRunner` từ "retrieve-once-and-hope" thành vòng lặp tự sửa lỗi thật sự, có thể quan sát được (traceable), với escalation rõ ràng khi vượt giới hạn tự sửa.
+
+### 5.1 Domain layer — types mới
+
+```
+Pharma.AiAssistant.Domain/
+  Ai/
+    RetrievalGrade.cs     ← enum: Relevant, Irrelevant, Insufficient
+    RetrievalOutcome.cs   ← record RetrievalOutcome(RetrievalGrade Grade, IReadOnlyList<Source> Sources, string? Reason)
+```
+
+`StreamEvent` (đã có, `[JsonPolymorphic]`) thêm 1 variant mới:
+
+```csharp
+// StreamEvent.cs — thêm variant
+public record EscalationEvent(string Reason, IReadOnlyList<string> AttemptedQueries) : StreamEvent;
+```
+
+→ UI nhận `EscalationEvent` để hiển thị banner "Cần con người xác nhận" thay vì coi đây là câu trả lời bình thường.
+
+### 5.2 Application layer — interfaces
+
+```
+Pharma.AiAssistant.Application/
+  Services/
+    IRetrievalGrader.cs   ← Task<RetrievalGrade> GradeAsync(string query, IReadOnlyList<SearchResult> results, ct)
+    IQueryRewriter.cs     ← Task<string> RewriteAsync(string originalQuery, string failureReason, ct)
+```
+
+Cả 2 nên là **1 LLM call rẻ** (model nhỏ hoặc cùng model hiện tại với prompt ngắn, temperature thấp) — không tái sử dụng `AgentRunner` (tránh vòng lặp lồng vòng lặp).
+
+```csharp
+public record GradeRequest(string Query, IReadOnlyList<SearchResult> Results);
+```
+
+### 5.3 Infrastructure layer
+
+```
+Pharma.AiAssistant.Infrastructure/
+  Services/
+    RelevanceGraderService.cs   ← implements IRetrievalGrader
+    QueryRewriterService.cs     ← implements IQueryRewriter
+  Tools/
+    SearchDrugTool.cs           ← sửa: thêm self-correction loop bên trong ExecuteAsync
+```
+
+**`RelevanceGraderService`** — 2 chiến lược, chọn 1 để bắt đầu đơn giản trước:
+- **Threshold-based (rẻ, nên làm trước):** nếu tất cả `SearchResult.Score` dưới ngưỡng (vd. `0.5`, config qua env `RAG_RELEVANCE_THRESHOLD`) → `Irrelevant`. Không tốn thêm LLM call.
+- **LLM-as-judge (chính xác hơn, làm sau nếu threshold không đủ):** prompt ngắn hỏi model "các đoạn trích này có trả lời được câu hỏi không?" → parse `Relevant`/`Irrelevant`/`Insufficient`.
+
+**`SearchDrugTool.ExecuteAsync`** — sửa flow thành:
+
+```csharp
+public async Task<ToolExecutionResult> ExecuteAsync(string toolUseId, JsonObject input, CancellationToken ct)
+{
+    var query = input["query"]!.GetValue<string>();
+    var drugClass = input["drug_class"]?.GetValue<string>();
+    var attempted = new List<string> { query };
+
+    for (int attempt = 0; attempt <= MaxRewriteAttempts; attempt++)
+    {
+        var vector  = await _embeddingService.GenerateEmbeddingAsync(query, ct);
+        var results = await _vectorSearchService.SearchAsync(vector, drugClass, topK: 5, ct);
+
+        var grade = await _grader.GradeAsync(query, results, ct);
+        if (grade == RetrievalGrade.Relevant)
+            return BuildSuccessResult(toolUseId, results);
+
+        if (attempt == MaxRewriteAttempts) break; // hết lượt tự sửa
+
+        query = await _rewriter.RewriteAsync(query, grade.ToString(), ct);
+        attempted.Add(query);
+    }
+
+    // Fallback: không phải throw — trả kết quả rỗng có đánh dấu, để AgentRunner/LLM biết mà escalate
+    return new ToolExecutionResult(toolUseId,
+        $"No relevant drug information found after {attempted.Count} query attempts: {string.Join(" → ", attempted)}. " +
+        "Answer must state this explicitly and suggest escalation if this is a critical safety question.",
+        IsError: false);
+}
+```
+
+`MaxRewriteAttempts` mặc định `2` (config qua env `RAG_MAX_REWRITE_ATTEMPTS`) — tổng cộng tối đa 3 lần search cho 1 tool call, tránh vòng lặp vô hạn/tốn cost.
+
+### 5.4 Escalation — AgentRunner
+
+Sau khi tool trả kết quả "no relevant data" (đánh dấu ở 5.3), **không** để LLM tự quyết định im lặng — `AgentRunner` cần phát hiện pattern này và emit `EscalationEvent` song song với câu trả lời cuối, để UI luôn hiển thị banner nhất quán thay vì phụ thuộc LLM có "nhớ" nói ra hay không:
+
+```csharp
+// AgentRunner.cs — sau khi collect ToolResultBlock[]
+var hasUnresolvedRetrieval = toolResults.Any(r => r.Content.Contains("No relevant drug information found after"));
+if (hasUnresolvedRetrieval && turns == options.MaxTurns) // hoặc: câu hỏi có vẻ critical (dosage/interaction) — heuristic đơn giản trước
+    yield return new EscalationEvent(
+        Reason: "Retrieval exhausted rewrite attempts without finding relevant data",
+        AttemptedQueries: /* lấy từ tool result */);
+```
+
+_Lưu ý: heuristic "câu hỏi critical" ban đầu có thể chỉ là keyword match (`dosage`, `interaction`, `contraindication`, `liều`, `tương tác`) — không cần ML, tinh chỉnh sau khi có dữ liệu thật._
+
+### 5.5 Observability — bật lại tracing
+
+- Bỏ guard `#if DEBUG` quanh `builder.AddServiceDefaults()` / `app.MapDefaultEndpoints()` trong `Program.cs` (Aspire `ServiceDefaults` đã wire sẵn OpenTelemetry, chỉ đang bị tắt ở Release).
+- Thêm `ActivitySource` riêng (`"Pharma.AiAssistant.Rag"`) bọc quanh: retrieval, grading, rewrite, mỗi tool call — set tag `rag.grade`, `rag.attempt`, `rag.rewritten_query` để trace hiển thị đúng bước nào tự sửa lỗi, giống ý "Diagnostic Tools" trong bài Microsoft.
+- Không cần Azure AI Tracing cụ thể ngay — `ActivitySource` chuẩn OTel là đủ, export sang bất kỳ backend nào sau (Aspire dashboard lúc dev, Application Insights lúc prod).
+
+### 5.6 NuGet packages cần thêm
+
+```
+(không cần thêm gì mới — ActivitySource nằm trong System.Diagnostics.DiagnosticSource, đã có sẵn qua ASP.NET Core)
+```
+
+### 5.7 Verify Phase 5
+
+```
+1. Query rõ ràng có trong KB (vd. "Warfarin dosage elderly")
+   → grade = Relevant ngay lần đầu, không rewrite, trace chỉ có 1 attempt
+
+2. Query mơ hồ/không có trong KB (vd. "thuốc gì tốt cho tim")
+   → grade = Irrelevant lần 1 → rewriter sinh câu cụ thể hơn → search lại
+   → nếu vẫn Irrelevant sau MaxRewriteAttempts → tool trả "no relevant data" có đánh dấu
+   → nếu câu hỏi match keyword critical → EscalationEvent xuất hiện, UI hiển thị banner
+
+3. Check Aspire dashboard / OTel export → thấy đủ span: retrieval → grade → rewrite → retry,
+   tag rõ ràng để debug được vì sao 1 câu trả lời bị escalate
+```
+
+---
+
+## Phase 6 — Multi-Agent (TaskQueue + AgentPool + SharedMemory) ❌ Chưa bắt đầu
 
 **Goal:** Câu hỏi phức tạp → nhiều agents chạy song song, chia sẻ kết quả.
 
@@ -486,7 +663,7 @@ Task C: Phân tích tương tác (dependsOn: A, B) (analyst)
 
 ---
 
-## Phase 6 — Coordinator + Orchestrator ❌ Chưa bắt đầu
+## Phase 7 — Coordinator + Orchestrator ❌ Chưa bắt đầu
 
 **Goal:** User hỏi ngôn ngữ tự nhiên → Coordinator tự sinh task list → chạy.
 
@@ -546,19 +723,16 @@ POST /api/analyze
 |-------|---------|
 | 1–3 (done) | `System.Net.Http.Json`, `MediatR`, `Npgsql.EntityFrameworkCore.PostgreSQL` |
 | 4 | `Qdrant.Client`, `OpenAI` |
+| 5 | _(không cần thêm — `System.Diagnostics.DiagnosticSource` đã có sẵn)_ |
 | All | `Microsoft.AspNetCore.OpenApi`, `Scalar.AspNetCore` |
 
 ---
 
 ## Bước tiếp theo
 
-1. **Phase 4 — RAG:**
-   - Move `IEmbeddingService` từ `Pharma.Document.Application/Services/` → `Pharma.SharedKernel.Application/Interfaces/`, update usings ở document-service
-   - Xóa `GetDrugInfoTool`
-   - Update `SearchDrugTool` schema (thêm `drug_class` optional param)
-   - Thêm `ListDrugClassesTool`
-   - Thêm `IVectorSearchService` + `QdrantVectorSearchService` + `OpenAiEmbeddingService` (implement SharedKernel interface)
-   - Implement `SearchDrugTool.ExecuteAsync` và `ListDrugClassesTool.ExecuteAsync`
-   - Wire DI: OpenAI embedding client + QdrantClient + env vars
-2. Phase 5: Multi-agent (TaskQueue + AgentPool + SharedMemory)
-3. Phase 6: Coordinator + Orchestrator
+_Cập nhật 2026-07-12: thêm Phase 5 (Self-Correction) vào giữa Phase 4 và Multi-Agent, dựa trên scan code thật + bài "Agentic RAG" của Microsoft. Việc còn lại:_
+
+1. **[Optional/vá lỗi] Rotate `OPENAI_API_KEY`** đang lộ trong `launchSettings.json` — chuyển sang user-secrets hoặc env ngoài, kiểm tra file này có bị commit lên git không.
+2. **Phase 5 — Self-Correction:** chưa có file nào. Nên làm **trước** Multi-agent vì đây là nền tảng chất lượng RAG mà mỗi agent trong pool (Phase 6) sẽ dùng lại — làm sau Phase 6 thì phải sửa lại nhiều tool ở nhiều agent cùng lúc. Thứ tự đề xuất trong phase: 5.1 → 5.3 (threshold-based grader trước, bỏ qua LLM-as-judge ban đầu) → 5.4 (escalation) → 5.5 (tracing) — LLM-as-judge grader để sau khi có dữ liệu thật đánh giá threshold có đủ tốt không.
+3. **Phase 6 — Multi-agent:** chưa có file nào (`TaskQueue`, `AgentPool`, `SharedMemory` — 0 kết quả grep toàn solution). Thiết kế ở phần Phase 6 bên dưới vẫn là plan (chưa implement), review lại trước khi bắt tay vì đã cách xa thời điểm viết ban đầu — cân nhắc tận dụng lại `AgentRunner`/`IAgentRunner` hiện có làm nền cho từng agent trong pool thay vì viết mới.
+4. **Phase 7 — Coordinator + Orchestrator:** chưa có file nào, phụ thuộc Phase 6 xong trước.
