@@ -66,6 +66,76 @@ stateDiagram-v2
 
 **Cascade failure:** nếu A fail, mọi task phụ thuộc A (trực tiếp/gián tiếp) tự động → `Skipped`, tránh bị treo mãi ở `Blocked` (deadlock).
 
+#### `TaskQueue` bản chất là gì? — trace tay từng bước
+
+Bỏ hết thuật ngữ "event", "cascade" sang 1 bên. `TaskQueue` chỉ là:
+
+1. **1 cuốn sổ** (`Dictionary<string, AgentTask>`) ghi tất cả task và trạng thái hiện tại của chúng.
+2. **1 người thư ký** biết đọc cuốn sổ đó và tự tay cập nhật nó mỗi khi có việc gì xảy ra (task nào xong, task nào fail).
+3. **1 cái loa** (event) để báo cho người khác biết "này, task X có thể chạy được rồi đó" — thay vì bắt người khác cứ phải hỏi liên tục "xong chưa? xong chưa?".
+
+Trace tay qua đúng ví dụ Warfarin/Amiodarone (A, B không phụ thuộc gì, C phụ thuộc [A, B]) để thấy cuốn sổ đó thay đổi ra sao theo từng bước.
+
+**Trạng thái ban đầu — trước khi gọi gì cả:**
+
+| Task | Status | DependsOn |
+|---|---|---|
+| A | (chưa tồn tại) | [] |
+| B | (chưa tồn tại) | [] |
+| C | (chưa tồn tại) | [A, B] |
+
+**Bước 1 — `queue.AddBatch([A, B, C])`**
+
+Thư ký mở cuốn sổ, ghi cả 3 task vào, và với **mỗi task** tự hỏi: "task này có `DependsOn` rỗng không?"
+
+| Task | Status sau AddBatch | Vì sao |
+|---|---|---|
+| A | `Pending` | `DependsOn = []` → không chờ ai |
+| B | `Pending` | `DependsOn = []` → không chờ ai |
+| C | `Blocked` | `DependsOn = [A, B]` → phải chờ |
+
+Vì A và B vừa chuyển `Pending`, thư ký hô lên (bắn event) `TaskReady(A)` và `TaskReady(B)`. C thì im lặng, chưa ai cần biết gì về nó.
+
+→ **Ai đó đang lắng nghe** (`MultiAgentAnalysisUseCase`, Step 6) nghe thấy `TaskReady(A)` và `TaskReady(B)`, liền đi giao cho `AgentPool` chạy cả 2 (dù có thể bị serialize nếu cùng `Assignee`, như §2.2 bên dưới).
+
+**Bước 2 — task A chạy xong, code gọi `queue.Complete("A", "Warfarin là...")`**
+
+Thư ký làm 2 việc:
+1. Mở sổ, sửa dòng A: `Status = Completed`, `Result = "Warfarin là..."`.
+2. Tự hỏi tiếp: "có task nào đang `Blocked` mà giờ *tất cả* `DependsOn` của nó đã `Completed` chưa?" → nhìn C: `DependsOn = [A, B]`, A đã `Completed` nhưng B thì **chưa** (B vẫn đang chạy) → C **vẫn `Blocked`**, không có gì thay đổi thêm.
+
+| Task | Status |
+|---|---|
+| A | `Completed` |
+| B | `Pending` (đang chạy — thực ra đã `InProgress`) |
+| C | `Blocked` |
+
+Đây chính là chỗ 1 helper nội bộ kiểu "tìm ai đang phụ thuộc task X" được dùng: thư ký phải **rà cả cuốn sổ** để tìm "ai đang đợi A" — tìm ra C, nhưng kiểm tra thấy C còn đợi B nữa nên chưa cho C chạy.
+
+**Bước 3 — task B chạy xong, `queue.Complete("B", "Amiodarone là...")`**
+
+1. Sửa dòng B: `Completed`.
+2. Rà sổ tìm ai đợi B → ra C. Kiểm tra **toàn bộ** `DependsOn` của C (`[A, B]`) → A đã `Completed`, B vừa `Completed` → **cả 2 đều xong** → C chuyển `Blocked → Pending`.
+3. Vì C vừa chuyển `Pending`, thư ký hô `TaskReady(C)`.
+
+| Task | Status |
+|---|---|
+| A | `Completed` |
+| B | `Completed` |
+| C | `Pending` ← **vừa đổi, do bước này** |
+
+Đây là "auto-unblock" nói ở trên: C **tự tỉnh dậy** đúng lúc, không cần ai code sẵn "chờ cả A và B xong rồi mới chạy C" theo kiểu thứ tự cứng — thư ký tự phát hiện ra điều đó bằng cách rà `DependsOn` mỗi lần có task hoàn thành.
+
+**Bước 4 — task C chạy xong, `queue.Complete("C", "Tương tác...")`**
+
+Sửa dòng C: `Completed`. Rà sổ tìm ai đợi C → không ai. Rà toàn bộ sổ → không còn task nào chưa `Completed` → bắn `AllCompleted`.
+
+**3 điều cần nắm chắc:**
+
+1. **`TaskQueue` không "chạy" gì cả** — nó không gọi LLM, không biết `AgentPool` là gì. Nó chỉ quản lý *sổ sách trạng thái* và tự tính toán ai được phép chạy tiếp theo.
+2. **Mọi quyết định đều dựa trên việc rà `DependsOn`** — không có bảng "thứ tự chạy" định sẵn nào cả. Mỗi lần 1 task xong, nó rà lại toàn bộ sổ từ đầu để xem có ai vừa đủ điều kiện chạy không.
+3. **Event chỉ là cách "thông báo"**, không phải cách "ra lệnh" — `TaskQueue` không tự chạy task C, nó chỉ hô lên `TaskReady(C)`; ai đó ở tầng ngoài (`UseCase`) phải tự nghe và tự đi gọi `AgentPool`.
+
 ### 2.2 `AgentPool` — kiểm soát concurrency
 
 ```csharp
